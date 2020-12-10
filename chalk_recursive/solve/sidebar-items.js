@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["RecursiveInferenceTableImpl",""]],"trait":[["SolveDatabase",""],["SolveIteration","The `solve_iteration` method -- implemented for any type that implements `SolveDb`."],["SolveIterationHelpers","Helper methods for `solve_iteration`, private to this module."]]});
