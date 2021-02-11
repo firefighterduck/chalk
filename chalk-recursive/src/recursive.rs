@@ -1,8 +1,11 @@
-use crate::search_graph::DepthFirstNumber;
 use crate::search_graph::SearchGraph;
-use crate::solve::{SolveDatabase, SolveIteration};
 use crate::stack::{Stack, StackDepth};
 use crate::{combine, Minimums, UCanonicalGoal};
+use crate::{search_graph::DepthFirstNumber, ExFallible, ExSolution};
+use crate::{
+    solve::{SolveDatabase, SolveIteration},
+    MaturityExtension,
+};
 use chalk_ir::interner::Interner;
 use chalk_ir::Fallible;
 use chalk_ir::{Canonical, ConstrainedSubst, Constraints, Goal, InEnvironment, UCanonical};
@@ -11,6 +14,11 @@ use rustc_hash::FxHashMap;
 use std::fmt;
 use tracing::debug;
 use tracing::{info, instrument};
+
+type CacheWithStart<I> = (
+    DepthFirstNumber,
+    FxHashMap<UCanonicalGoal<I>, ExFallible<ExSolution<I>>>,
+);
 
 struct RecursiveContext<I: Interner> {
     stack: Stack,
@@ -23,6 +31,10 @@ struct RecursiveContext<I: Interner> {
     /// Things are added to the cache when we have completely processed their
     /// result.
     cache: FxHashMap<UCanonicalGoal<I>, Fallible<Solution<I>>>,
+
+    /// Another cache for coinductive solutions that might be disproven later on.
+    /// The DFN marks the start goal of the cycle.
+    coinductive_cache: Option<CacheWithStart<I>>,
 
     /// The maximum size for goals.
     max_size: usize,
@@ -69,8 +81,8 @@ trait MergeWith<T> {
         F: FnOnce(T, T) -> T;
 }
 
-impl<T> MergeWith<T> for Fallible<T> {
-    fn merge_with<F>(self: Fallible<T>, other: Fallible<T>, f: F) -> Fallible<T>
+impl<T> MergeWith<T> for ExFallible<T> {
+    fn merge_with<F>(self: ExFallible<T>, other: ExFallible<T>, f: F) -> ExFallible<T>
     where
         F: FnOnce(T, T) -> T,
     {
@@ -88,6 +100,7 @@ impl<I: Interner> RecursiveContext<I> {
             stack: Stack::new(overflow_depth),
             search_graph: SearchGraph::new(),
             cache: FxHashMap::default(),
+            coinductive_cache: None,
             max_size,
             caching_enabled,
         }
@@ -127,7 +140,7 @@ impl<'me, I: Interner> Solver<'me, I> {
         debug!("solve_root_goal(canonical_goal={:?})", canonical_goal);
         assert!(self.context.stack.is_empty());
         let minimums = &mut Minimums::new();
-        self.solve_goal(canonical_goal.clone(), minimums)
+        self.solve_goal(canonical_goal.clone(), minimums).cut()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -166,28 +179,33 @@ impl<'me, I: Interner> Solver<'me, I> {
             let old_answer = &self.context.search_graph[dfn].solution;
             let old_prio = self.context.search_graph[dfn].solution_priority;
 
+            // If the answer was at one point premature,
+            // the final answer is also premature.
+            let answer_maturity = current_answer.is_mature() && old_answer.is_mature();
+
             let (current_answer, current_prio) = combine::with_priorities_for_goal(
                 self.program.interner(),
                 &canonical_goal.canonical.value.goal,
-                old_answer.clone(),
+                old_answer.clone().cut(),
                 old_prio,
-                current_answer,
+                current_answer.cut(),
                 current_prio,
             );
+            let current_answer_ex = ExFallible::extend(current_answer, Some(answer_maturity));
 
             // Some of our subgoals depended on us. We need to re-run
             // with the current answer.
-            if self.context.search_graph[dfn].solution == current_answer {
+            if self.context.search_graph[dfn].solution == current_answer_ex {
                 // Reached a fixed point.
                 return *minimums;
             }
 
-            let current_answer_is_ambig = match &current_answer {
+            let current_answer_is_ambig = match &current_answer_ex {
                 Ok(s) => s.is_ambig(),
                 Err(_) => false,
             };
 
-            self.context.search_graph[dfn].solution = current_answer;
+            self.context.search_graph[dfn].solution = current_answer_ex;
             self.context.search_graph[dfn].solution_priority = current_prio;
 
             // Subtle: if our current answer is ambiguous, we can just stop, and
@@ -212,11 +230,22 @@ impl<'me, I: Interner> SolveDatabase<I> for Solver<'me, I> {
         &mut self,
         goal: UCanonicalGoal<I>,
         minimums: &mut Minimums,
-    ) -> Fallible<Solution<I>> {
+    ) -> ExFallible<ExSolution<I>> {
         // First check the cache.
         if let Some(value) = self.context.cache.get(&goal) {
             debug!("solve_reduced_goal: cache hit, value={:?}", value);
-            return value.clone();
+            return ExFallible::extend(value.clone(), None);
+        }
+
+        // Then check the cache for results dependent on a coinductive cycle.
+        if let Some((_, ref mut cache)) = self.context.coinductive_cache {
+            if let Some(value) = cache.get(&goal) {
+                debug!(
+                    "solve_reduced_goal: coinductive cache hit, value={:?}",
+                    value
+                );
+                return value.clone();
+            }
         }
 
         // Next, check if the goal is in the search tree already.
@@ -234,19 +263,26 @@ impl<'me, I: Interner> SolveDatabase<I> for Solver<'me, I> {
                         subst: goal.trivial_substitution(self.program.interner()),
                         constraints: Constraints::empty(self.program.interner()),
                     };
+                    let solution = ExFallible::extend(
+                        Ok(Solution::Unique(Canonical {
+                            value,
+                            binders: goal.canonical.binders.clone(),
+                        })),
+                        Some(false),
+                    );
 
                     debug!("applying coinductive semantics");
+                    debug!("assume solution {:?} for goal {:#?}", solution, goal);
 
-                    // Set minimum to first occurrence of cyclic goal to prevent premature caching of possibly invalid solutions
-                    minimums.update_from(self.context.search_graph[dfn].links);
+                    if self.context.coinductive_cache.is_none() && self.context.caching_enabled {
+                        self.context.coinductive_cache = Some((dfn, FxHashMap::default()));
+                    }
 
-                    // Mark the start of the coinductive cycle
-                    self.context.search_graph[dfn].coinductive_start = true;
+                    if let Some((_, ref mut cache)) = self.context.coinductive_cache {
+                        cache.insert(goal, solution.clone());
+                    }
 
-                    return Ok(Solution::Unique(Canonical {
-                        value,
-                        binders: goal.canonical.binders,
-                    }));
+                    return solution;
                 }
 
                 self.context.stack[depth].flag_cycle();
@@ -278,20 +314,59 @@ impl<'me, I: Interner> SolveDatabase<I> for Solver<'me, I> {
             let result = self.context.search_graph[dfn].solution.clone();
             let priority = self.context.search_graph[dfn].solution_priority;
 
+            let mut coinductive_cache_cleared = false;
+
             // If processing this subgoal did not involve anything
             // outside of its subtree, then we can promote it to the
             // cache now. This is a sort of hack to alleviate the
             // worst of the repeated work that we do during tabling.
             if subgoal_minimums.positive >= dfn {
                 if self.context.caching_enabled {
-                    // Remove possible false positives from coinductive cycle
-                    if self.context.search_graph[dfn].coinductive_start && result.is_err() {
-                        self.context.search_graph.remove_false_positives_after(dfn);
+                    if let Some((start_dfn, ref mut coinductive_cache)) =
+                        self.context.coinductive_cache
+                    {
+                        if dfn == start_dfn {
+                            debug!("solve_reduced_goal: Coinductive cycle start encountered, moving temporary cache");
+                            // If the start of a coinductive cycle is going to be cached (and the initial assumption holds),
+                            // the additional cache can be transferred to the actual cache.
+                            // Otherwise, if the assumption was disproved, the coinductive cache can be cleared.
+                            if self.context.search_graph[dfn].solution.is_ok() {
+                                for (goal, solution) in coinductive_cache.drain() {
+                                    // Move all cached coinductive results that are not the assumption to the actual cache.
+                                    if self
+                                        .context
+                                        .search_graph
+                                        .lookup(&goal)
+                                        .map(|dfn| dfn != start_dfn)
+                                        .unwrap_or(true)
+                                    {
+                                        self.context.cache.insert(goal, solution.cut());
+                                    }
+                                }
+                            } else {
+                                coinductive_cache.clear();
+                            }
+                            coinductive_cache_cleared = true;
+
+                            // Cache the actual result for the start of the coinductive cycle
+                            self.context
+                                .search_graph
+                                .move_to_cache(dfn, &mut self.context.cache);
+                        } else if !self.context.search_graph[dfn].solution.is_mature() {
+                            self.context
+                                .search_graph
+                                .move_to_cache_ex(dfn, coinductive_cache);
+                        } else {
+                            self.context
+                                .search_graph
+                                .move_to_cache(dfn, &mut self.context.cache);
+                        }
+                    } else {
+                        self.context
+                            .search_graph
+                            .move_to_cache(dfn, &mut self.context.cache);
                     }
 
-                    self.context
-                        .search_graph
-                        .move_to_cache(dfn, &mut self.context.cache);
                     debug!("solve_reduced_goal: SCC head encountered, moving to cache");
                 } else {
                     debug!(
@@ -299,6 +374,10 @@ impl<'me, I: Interner> SolveDatabase<I> for Solver<'me, I> {
                     );
                     self.context.search_graph.rollback_to(dfn);
                 }
+            }
+
+            if coinductive_cache_cleared {
+                self.context.coinductive_cache = None;
             }
 
             info!("solve_goal: solution = {:?} prio {:?}", result, priority);

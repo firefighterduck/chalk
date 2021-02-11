@@ -1,15 +1,15 @@
 use crate::solve::SolveDatabase;
-use crate::Minimums;
-use chalk_ir::cast::Cast;
+use crate::{ExFallible, ExNoSolution, ExSolution, MaturityExtension, Minimums};
 use chalk_ir::fold::Fold;
 use chalk_ir::interner::{HasInterner, Interner};
 use chalk_ir::visit::Visit;
 use chalk_ir::zip::Zip;
+use chalk_ir::{cast::Cast, NoSolution};
 use chalk_ir::{
     Binders, Canonical, ConstrainedSubst, Constraint, Constraints, DomainGoal, Environment, EqGoal,
-    Fallible, GenericArg, Goal, GoalData, InEnvironment, NoSolution, ProgramClauseImplication,
-    QuantifierKind, Substitution, SubtypeGoal, TyKind, TyVariableKind, UCanonical,
-    UnificationDatabase, UniverseMap, Variance,
+    Fallible, GenericArg, Goal, GoalData, InEnvironment, ProgramClauseImplication, QuantifierKind,
+    Substitution, SubtypeGoal, TyKind, TyVariableKind, UCanonical, UnificationDatabase,
+    UniverseMap, Variance,
 };
 use chalk_solve::debug_span;
 use chalk_solve::infer::{InferenceTable, ParameterEnaVariableExt};
@@ -20,15 +20,35 @@ use std::fmt::Debug;
 use tracing::{debug, instrument};
 
 enum Outcome {
-    Complete,
-    Incomplete,
+    Complete(bool),
+    Incomplete(bool),
 }
 
 impl Outcome {
     fn is_complete(&self) -> bool {
-        match *self {
-            Outcome::Complete => true,
-            _ => false,
+        matches!(self, Self::Complete(_))
+    }
+}
+
+impl MaturityExtension for Outcome {
+    type Base = Outcome;
+
+    fn is_mature(&self) -> bool {
+        match self {
+            &Self::Complete(mature) => mature,
+            &Self::Incomplete(mature) => mature,
+        }
+    }
+
+    fn cut(self) -> Self::Base {
+        self
+    }
+
+    fn extend(b: Self::Base, mature: Option<bool>) -> Self {
+        let mature = mature.unwrap_or(true);
+        match b {
+            Self::Complete(_) => Self::Complete(mature),
+            Self::Incomplete(_) => Self::Incomplete(mature),
         }
     }
 }
@@ -52,14 +72,37 @@ enum Obligation<I: Interner> {
 struct PositiveSolution<I: Interner> {
     free_vars: Vec<GenericArg<I>>,
     universes: UniverseMap,
-    solution: Solution<I>,
+    solution: ExSolution<I>,
 }
 
 /// When refuting a goal, there's no impact on inference state.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum NegativeSolution {
-    Refuted,
-    Ambiguous,
+    Refuted(bool),
+    Ambiguous(bool),
+}
+
+impl MaturityExtension for NegativeSolution {
+    type Base = NegativeSolution;
+
+    fn is_mature(&self) -> bool {
+        match self {
+            &Self::Refuted(mature) => mature,
+            &Self::Ambiguous(mature) => mature,
+        }
+    }
+
+    fn cut(self) -> Self::Base {
+        self
+    }
+
+    fn extend(b: Self::Base, mature: Option<bool>) -> Self {
+        let mature = mature.unwrap_or(true);
+        match b {
+            Self::Refuted(_) => Self::Refuted(mature),
+            Self::Ambiguous(_) => Self::Ambiguous(mature),
+        }
+    }
 }
 
 fn canonicalize<I: Interner, T>(
@@ -145,7 +188,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         subst: Substitution<I>,
         canonical_goal: InEnvironment<DomainGoal<I>>,
         clause: &Binders<ProgramClauseImplication<I>>,
-    ) -> Fallible<Self> {
+    ) -> ExFallible<Self> {
         let mut fulfill = Fulfill {
             solver,
             infer,
@@ -171,20 +214,16 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
 
         debug!("the subst is {:?}", fulfill.subst);
 
-        if let Err(e) = fulfill.unify(
+        fulfill.unify(
             &canonical_goal.environment,
             Variance::Invariant,
             &canonical_goal.goal,
             &consequence,
-        ) {
-            return Err(e);
-        }
+        )?;
 
         // if so, toss in all of its premises
         for condition in conditions.as_slice(fulfill.solver.interner()) {
-            if let Err(e) = fulfill.push_goal(&canonical_goal.environment, condition.clone()) {
-                return Err(e);
-            }
+            fulfill.push_goal(&canonical_goal.environment, condition.clone())?;
         }
 
         Ok(fulfill)
@@ -195,7 +234,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         infer: InferenceTable<I>,
         subst: Substitution<I>,
         canonical_goal: InEnvironment<Goal<I>>,
-    ) -> Fallible<Self> {
+    ) -> ExFallible<Self> {
         let mut fulfill = Fulfill {
             solver,
             infer,
@@ -205,10 +244,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
             cannot_prove: false,
         };
 
-        if let Err(e) = fulfill.push_goal(&canonical_goal.environment, canonical_goal.goal.clone())
-        {
-            return Err(e);
-        }
+        fulfill.push_goal(&canonical_goal.environment, canonical_goal.goal.clone())?;
 
         Ok(fulfill)
     }
@@ -254,7 +290,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         variance: Variance,
         a: &T,
         b: &T,
-    ) -> Fallible<()>
+    ) -> ExFallible<()>
     where
         T: ?Sized + Zip<I> + Debug,
     {
@@ -266,7 +302,8 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
             variance,
             a,
             b,
-        )?;
+        )
+        .map_err(|e| ExNoSolution::extend(e, None))?;
         debug!("unify({:?}, {:?}) succeeded", a, b);
         debug!("unify: goals={:?}", goals);
         for goal in goals {
@@ -283,7 +320,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         &mut self,
         environment: &Environment<I>,
         goal: Goal<I>,
-    ) -> Fallible<()> {
+    ) -> ExFallible<()> {
         let interner = self.solver.interner();
         match goal.data(interner) {
             GoalData::Quantified(QuantifierKind::ForAll, subgoal) => {
@@ -350,7 +387,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         &mut self,
         wc: InEnvironment<Goal<I>>,
         minimums: &mut Minimums,
-    ) -> Fallible<PositiveSolution<I>> {
+    ) -> ExFallible<PositiveSolution<I>> {
         let interner = self.solver.interner();
         let (quantified, free_vars) = canonicalize(&mut self.infer, interner, wc);
         let (quantified, universes) = u_canonicalize(&mut self.infer, interner, &quantified);
@@ -362,7 +399,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         })
     }
 
-    fn refute(&mut self, goal: InEnvironment<Goal<I>>) -> Fallible<NegativeSolution> {
+    fn refute(&mut self, goal: InEnvironment<Goal<I>>) -> ExFallible<NegativeSolution> {
         let canonicalized = match self
             .infer
             .invert_then_canonicalize(self.solver.interner(), goal)
@@ -371,7 +408,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
             None => {
                 // Treat non-ground negatives as ambiguous. Note that, as inference
                 // proceeds, we may wind up with more information here.
-                return Ok(NegativeSolution::Ambiguous);
+                return Ok(NegativeSolution::Ambiguous(false));
             }
         };
 
@@ -379,14 +416,16 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         let (quantified, _) =
             u_canonicalize(&mut self.infer, self.solver.interner(), &canonicalized);
         let mut minimums = Minimums::new(); // FIXME -- minimums here seems wrong
-        if let Ok(solution) = self.solver.solve_goal(quantified, &mut minimums) {
+        let solution = self.solver.solve_goal(quantified, &mut minimums);
+        if let Ok(solution) = solution {
+            let solution_mature = solution.is_mature();
             if solution.is_unique() {
-                Err(NoSolution)
+                Err(ExNoSolution::extend(NoSolution, Some(solution_mature)))
             } else {
-                Ok(NegativeSolution::Ambiguous)
+                Ok(NegativeSolution::Ambiguous(solution_mature))
             }
         } else {
-            Ok(NegativeSolution::Refuted)
+            Ok(NegativeSolution::Refuted(solution.is_mature()))
         }
     }
 
@@ -434,7 +473,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         }
     }
 
-    fn fulfill(&mut self, minimums: &mut Minimums) -> Fallible<Outcome> {
+    fn fulfill(&mut self, minimums: &mut Minimums) -> ExFallible<Outcome> {
         debug_span!("fulfill", obligations=?self.obligations);
 
         // Try to solve all the obligations. We do this via a fixed-point
@@ -444,6 +483,7 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         // learning new things about our inference state.
         let mut obligations = Vec::with_capacity(self.obligations.len());
         let mut progress = true;
+        let mut outcome_mature = true;
 
         while progress {
             progress = false;
@@ -482,11 +522,16 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
                             }
                         }
 
+                        // If at least one of the subgoals returned an premature result
+                        // then the whole outcome is premature.
+                        outcome_mature &= solution.is_mature();
+
                         solution.is_ambig()
                     }
                     Obligation::Refute(goal) => {
                         let answer = self.refute(goal.clone())?;
-                        answer == NegativeSolution::Ambiguous
+                        outcome_mature &= answer.is_mature();
+                        answer == NegativeSolution::Ambiguous(outcome_mature)
                     }
                 };
 
@@ -506,24 +551,24 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
         assert!(obligations.is_empty());
 
         if self.obligations.is_empty() {
-            Ok(Outcome::Complete)
+            Ok(Outcome::Complete(outcome_mature))
         } else {
-            Ok(Outcome::Incomplete)
+            Ok(Outcome::Incomplete(outcome_mature))
         }
     }
 
     /// Try to fulfill all pending obligations and build the resulting
     /// solution. The returned solution will transform `subst` substitution with
     /// the outcome of type inference by updating the replacements it provides.
-    pub(super) fn solve(mut self, minimums: &mut Minimums) -> Fallible<Solution<I>> {
-        let outcome = match self.fulfill(minimums) {
-            Ok(o) => o,
-            Err(e) => return Err(e),
-        };
+    pub(super) fn solve(mut self, minimums: &mut Minimums) -> ExFallible<ExSolution<I>> {
+        let outcome = self.fulfill(minimums)?;
 
         if self.cannot_prove {
             debug!("Goal cannot be proven (cannot_prove = true), returning ambiguous");
-            return Ok(Solution::Ambig(Guidance::Unknown));
+            return Ok(ExSolution::extend(
+                Solution::Ambig(Guidance::Unknown),
+                Some(outcome.is_mature()),
+            ));
         }
 
         if outcome.is_complete() {
@@ -539,7 +584,10 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
                     constraints,
                 },
             );
-            return Ok(Solution::Unique(constrained.0));
+            return Ok(ExSolution::extend(
+                Solution::Unique(constrained.0),
+                Some(outcome.is_mature()),
+            ));
         }
 
         // Otherwise, we have (positive or negative) obligations remaining, but
@@ -573,12 +621,18 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
                         solution.constrained_subst(self.solver.interner())
                     {
                         self.apply_solution(free_vars, universes, constrained_subst);
-                        return Ok(Solution::Ambig(Guidance::Suggested(canonical_subst.0)));
+                        return Ok(ExSolution::extend(
+                            Solution::Ambig(Guidance::Suggested(canonical_subst.0)),
+                            Some(solution.is_mature()),
+                        ));
                     }
                 }
             }
 
-            Ok(Solution::Ambig(Guidance::Unknown))
+            Ok(ExSolution::extend(
+                Solution::Ambig(Guidance::Unknown),
+                Some(outcome.is_mature()),
+            ))
         } else {
             // While we failed to prove the goal, we still learned that
             // something had to hold. Here's an example where this happens:
@@ -600,7 +654,10 @@ impl<'s, I: Interner, Solver: SolveDatabase<I>> Fulfill<'s, I, Solver> {
             // for sure what `T` must be (it could be either `Foo<Bar>` or
             // `Foo<Baz>`, but we *can* say for sure that it must be of the
             // form `Foo<?0>`.
-            Ok(Solution::Ambig(Guidance::Definite(canonical_subst.0)))
+            Ok(ExSolution::extend(
+                Solution::Ambig(Guidance::Definite(canonical_subst.0)),
+                Some(outcome.is_mature()),
+            ))
         }
     }
 

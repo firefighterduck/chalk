@@ -1,12 +1,12 @@
 use super::combine;
 use super::fulfill::Fulfill;
-use crate::{Minimums, UCanonicalGoal};
+use crate::{ExFallible, ExNoSolution, ExSolution, MaturityExtension, Minimums, UCanonicalGoal};
 use chalk_ir::could_match::CouldMatch;
 use chalk_ir::fold::Fold;
 use chalk_ir::interner::{HasInterner, Interner};
 use chalk_ir::{
-    Canonical, ClausePriority, DomainGoal, Fallible, Floundered, Goal, GoalData, InEnvironment,
-    NoSolution, ProgramClause, ProgramClauseData, Substitution, UCanonical,
+    Canonical, ClausePriority, DomainGoal, Floundered, Goal, GoalData, InEnvironment,
+    ProgramClause, ProgramClauseData, Substitution, UCanonical,
 };
 use chalk_solve::clauses::program_clauses_that_could_match;
 use chalk_solve::debug_span;
@@ -19,7 +19,7 @@ pub(super) trait SolveDatabase<I: Interner>: Sized {
         &mut self,
         goal: UCanonical<InEnvironment<Goal<I>>>,
         minimums: &mut Minimums,
-    ) -> Fallible<Solution<I>>;
+    ) -> ExFallible<ExSolution<I>>;
 
     fn max_size(&self) -> usize;
 
@@ -39,7 +39,7 @@ pub(super) trait SolveIteration<I: Interner>: SolveDatabase<I> {
         &mut self,
         canonical_goal: &UCanonicalGoal<I>,
         minimums: &mut Minimums,
-    ) -> (Fallible<Solution<I>>, ClausePriority) {
+    ) -> (ExFallible<ExSolution<I>>, ClausePriority) {
         let UCanonical {
             universes,
             canonical:
@@ -107,7 +107,7 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
         &mut self,
         canonical_goal: &UCanonicalGoal<I>,
         minimums: &mut Minimums,
-    ) -> (Fallible<Solution<I>>, ClausePriority) {
+    ) -> (ExFallible<ExSolution<I>>, ClausePriority) {
         let (infer, subst, goal) = self.new_inference_table(canonical_goal);
         match Fulfill::new_with_simplification(self, infer, subst, goal) {
             Ok(fulfill) => (fulfill.solve(minimums), ClausePriority::High),
@@ -122,7 +122,7 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
         &mut self,
         canonical_goal: &UCanonical<InEnvironment<DomainGoal<I>>>,
         minimums: &mut Minimums,
-    ) -> (Fallible<Solution<I>>, ClausePriority) {
+    ) -> (ExFallible<ExSolution<I>>, ClausePriority) {
         let mut clauses = vec![];
 
         let db = self.db();
@@ -137,7 +137,10 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
         match program_clauses_that_could_match(db, canonical_goal) {
             Ok(goal_clauses) => clauses.extend(goal_clauses.into_iter().filter(could_match)),
             Err(Floundered) => {
-                return (Ok(Solution::Ambig(Guidance::Unknown)), ClausePriority::High);
+                return (
+                    Ok(ExSolution::extend(Solution::Ambig(Guidance::Unknown), None)),
+                    ClausePriority::High,
+                );
             }
         }
 
@@ -149,13 +152,17 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
                 .filter(could_match),
         );
 
-        let mut cur_solution = None;
+        let mut cur_solution: Option<(ExSolution<I>, ClausePriority)> = None;
         for program_clause in clauses {
             debug_span!("solve_from_clauses", clause = ?program_clause);
 
             // If we have a completely ambiguous answer, it's not going to get better, so stop
-            if cur_solution == Some((Solution::Ambig(Guidance::Unknown), ClausePriority::High)) {
-                return (Ok(Solution::Ambig(Guidance::Unknown)), ClausePriority::High);
+            if let Some((ref cur_solution, cur_prio)) = cur_solution {
+                if *cur_solution == Solution::Ambig(Guidance::Unknown)
+                    && cur_prio == ClausePriority::High
+                {
+                    return (Ok(cur_solution.clone()), cur_prio);
+                }
             }
 
             let ProgramClauseData(implication) = program_clause.data(self.interner());
@@ -171,20 +178,29 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
                 debug!(?solution, ?priority, "Ok");
                 cur_solution = Some(match cur_solution {
                     None => (solution, priority),
-                    Some((cur, cur_priority)) => combine::with_priorities(
-                        self.interner(),
-                        &canonical_goal.canonical.value.goal,
-                        cur,
-                        cur_priority,
-                        solution,
-                        priority,
-                    ),
+                    Some((cur, cur_priority)) => {
+                        // If at least one fitting clause has a premature answer,
+                        // the answer for the whole goal is premature.
+                        let solution_mature = cur.is_mature() && solution.is_mature();
+                        let (solution, prio) = combine::with_priorities(
+                            self.interner(),
+                            &canonical_goal.canonical.value.goal,
+                            cur.cut(),
+                            cur_priority,
+                            solution.cut(),
+                            priority,
+                        );
+                        (ExSolution::extend(solution, Some(solution_mature)), prio)
+                    }
                 });
             } else {
                 debug!("Error");
             }
         }
-        cur_solution.map_or((Err(NoSolution), ClausePriority::High), |(s, p)| (Ok(s), p))
+        cur_solution.map_or(
+            (Err(ExNoSolution::NoMature), ClausePriority::High),
+            |(s, p)| (Ok(s), p),
+        )
     }
 
     fn new_inference_table<T: Fold<I, Result = T> + HasInterner<Interner = I> + Clone>(
