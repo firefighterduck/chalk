@@ -360,6 +360,82 @@ fn coinductive_unsound_nested() {
 }
 
 #[test]
+fn coinductive_unsound_nested2() {
+    test! {
+        program {
+            trait C1andC7 { }
+
+            #[coinductive]
+            trait C1 { }
+
+            #[coinductive]
+            trait C2 { }
+
+            #[coinductive]
+            trait C3 { }
+
+            #[coinductive]
+            trait C4 { }
+
+            #[coinductive]
+            trait C5 { }
+
+            #[coinductive]
+            trait C6 { }
+
+            #[coinductive]
+            trait C7 { }
+
+            forall<T> {
+                T: C7 if T: C3
+            }
+
+            forall<T> {
+                T: C4 if T: C7, T: C5
+            }
+
+            forall<T> {
+                T: C3 if T:C4
+            }
+
+            forall<T> {
+                T: C6 if T: C1
+            }
+
+            forall<T> {
+                T: C2 if T: C6
+            }
+
+            forall<T> {
+                T: C2 if T: C3
+            }
+
+            forall<T> {
+                T: C1 if T: C2
+            }
+
+            forall<T> {
+                T: C1andC7 if T: C1, T: C7
+            }
+        }
+
+        goal {
+            forall<X> { X: C1andC7 }
+        } yields[SolverChoice::slg_default()] {
+            "No possible solution"
+        }
+
+        goal {
+            forall<X> { X: C1andC7 }
+        } yields[SolverChoice::recursive_default()] {
+            // FIXME: This should be "No possible solution" and is a bug
+            // introduced by the two level caching
+            "Unique; substitution [], lifetime constraints []"
+        }
+    }
+}
+
+#[test]
 fn coinductive_multicycle1() {
     test! {
         program {

@@ -33,7 +33,7 @@ As such, `C1` can also not be proven for this program.
 The recursive solver will now attempt to prove the initial goal `C` by solving `C2`.
 Unfortunately, it finds the invalidly cached solution and returns it as proof for `C`.
 
-By visualizing this path of computation, it becomes evident, where the problem lies:
+By visualizing this path of computation, the problem becomes evident:
 * Start proving `C` with `C1`:
     * For `C1` prove `C2` and `C3`:
         * For `C2` prove `C1`:
@@ -47,34 +47,17 @@ By visualizing this path of computation, it becomes evident, where the problem l
 
 ### The Solution
 The above example should make it evident that the caching of found solutions in coinductive cycles can lead to false positives and should therefore be prevented.
-This can be achieved by delaying the caching of all results inside the coinductive cycle until it is clear whether the start of the cycle (i.e. `C1` in the example above) is provable.
-If the start of the cycle can be proven by the results of the cycle and related subgoals then the assumption about it was correct and thus all results for goals inside the cycle are also valid.
-If, however, the start of the cycle can not be proved, i.e. the initial assumption was false, then a subset of the found solutions for the coinductive cycle may be invalid (i.e. the solution for `C2` in the example).
-This subset can (probably) only consist of positive results, i.e. derived solutions that could reference the assumption.
+One approach to achieve this is to use a second dedicated cache for results that depend on the initial assumption of a coinductive cycle.
+This cache can then either be deleted if the assumption did not hold or moved to the standard cache if it did hold.
 
-Negative results should not be influenced by the positive assumption as refutability can not be followed from provability.
-As a result, it is sound to over-approximate and remove all positive solutions if the start of the cycle is disproved.
-Therefore, the recursive solver delays caching by relating all solutions in the cycle too its start (i.e. by adjusting the minimum in this subtree) and removes all positive results inside the coinductive cycle if and only if the start is disproven.
-The only downside of this approach is the late caching which might lead to increased work for shared subgoals in the same proof sub-tree as the coinductive cycle.
+The tricky part about this two-leveled cache is tracking which results are generally valid and can thus be cached (these is called "mature" results in the following) and which results depend on an assumption ("premature" results).
+For each coinductive cycle, the first result that is determined to be premature is the assumption itself, i.e. the result for the cycle start (`C1` in the above example).
+Results for other goals are labeled premature if at least one subgoal has a premature result (e.g. `C2` depends on `C1`, thus `C2` is also premature).
+Finished goals that have a premature result are then stored in the temporary cache.
+For the caches the following invariant holds: results stored in the temporary cache are by definition premature whereas all results in the standard cache are mature.
+When the final result of the outermost cycle start (the depth first number of the corresponding goal is stored with the temporary cache) is determined, the premature results become mature (i.e. if the initial assumption holds) or are dropped together with the temporary cache (i.e. if the assumption was disproved).
 
-With this procedure, the example is handled as follows:
-* Start proving `C` with `C1`:
-    * For `C1` prove `C2` and `C3`:
-        * For `C2` prove `C1`:
-            * This is a coinductive cycle. Assume that `C1` holds.
-        * Thus `C2` also holds. Delay the caching of the result about `C2`.
-        * There is no way to prove `C3`. Lift this failure up.
-    * Due to the failure of `C3` there is also no solution for `C1`. Cache this result as well as the failure of `C3` but delete everything about `C2`.
-* Start proving `C` with `C2`:
-    * For `C2` prove `C1`:
-        * Find the cached result that `C1` is disproved.
-    * Follow that `C2` is also disproved and cache this result.
-* Stop with the valid disproof of `C`.
-
-### Other Concerns
-Another possible concern is related to the [search graph](./search_graph.md).
-As the solutions of the coinductive cycle are only moved to the cache after a certain delay, they are still part of the search graph and might influence other computations as such.
-Fortunately, as long as the subtree with the coinductive cycle is not finished all solutions within the graph can be assumed to be valid. 
-This follows directly from the initial assumption and the fact that every goal that is investigated by the solver can still contribute to the whole cycle's validity (errors are propagated upwards directly).
-This is especially important as reoccurring nodes in the search graph could also denote inductive cycles.
-Though, as all nodes from inside the coinductive cycle are directly related to its start, they are not treated as part of any other cycle and the computed solutions are still valid in this context. 
+### Persistent Problems
+If there exists a nested coinductive cycle where the inner one results into a disprove of its assumption but the outer one proves its assumption, there could still be false positives.
+That is because the temporary cache does not keep track of which assumptions a result depends on.
+An example for this is the test case `coinductive_unsound_nested2`.
